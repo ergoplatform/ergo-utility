@@ -21,7 +21,7 @@ object PathMatcher extends App {
 
   def checkLeafsAtRange(
     env: TaskEnv,
-    basePath: List[Int],
+    basePath: Seq[Int],
     minLeafIdx: Int,
     maxLeafIdx: Int
   )(implicit ae: ErgoAddressEncoder): Option[DerivationPath] = {
@@ -40,18 +40,18 @@ object PathMatcher extends App {
 
   def checkSubtree(
     env: TaskEnv,
-    basePath: List[Int],
-    leafsNum: Int,
+    basePath: Seq[Int],
+    leafsNum: Int
   )(implicit ae: ErgoAddressEncoder): UIO[Option[DerivationPath]] = {
-    def checkNext: UIO[Option[DerivationPath]] =
-      if (basePath.size > 1 && basePath.last < leafsNum)
-        checkSubtree(
-          env,
-          basePath.init :+ basePath.last + 1,
-          leafsNum
-        )
-      else
-        checkSubtree(env, basePath :+ 0, leafsNum)
+    def nextPath: Seq[Int] =
+      if (basePath.size > 1 && basePath.last < leafsNum) {
+        basePath.init :+ basePath.last + 1
+      } else if (basePath.size == 1 || basePath.tail.forall(_ >= leafsNum)) {
+        Array.fill(basePath.size)(0) :+ 0
+      } else {
+        val (uncomplete, complete) = basePath.tail.init.partition(_ < leafsNum)
+        basePath.head +: ((uncomplete.init :+ (uncomplete.last + 1)) ++ complete) :+ 0
+      }
     val windowSize = (leafsNum.toFloat / env.numCores).ceil.toInt
     (0 to leafsNum)
       .grouped(windowSize)
@@ -63,7 +63,9 @@ object PathMatcher extends App {
       }
       .flatMap {
         _.collectFirst { case Some(path) => path }
-          .fold(checkNext)(r => UIO.succeed(Some(r)))
+          .fold(checkSubtree(env, nextPath, leafsNum))(
+            r => UIO.succeed(Some(r))
+          )
       }
   }
 
@@ -77,30 +79,31 @@ object PathMatcher extends App {
   def task(
     env: TaskEnv
   )(implicit ae: ErgoAddressEncoder): UIO[Option[String]] =
-    checkSubtree(env, List(0), env.leafsNum).map(_.map(_.encoded))
+    checkSubtree(env, Array(0), env.leafsNum).map(_.map(_.encoded))
 
   def program(args: Array[String]): ZIO[Any, Throwable, Unit] =
-      IO.fromTry(argParser.parse(args))
-        .flatMap { args =>
-          val ae = ErgoAddressEncoder(args.networkPrefix)
-          IO.fromTry(ae.fromString(args.address)).flatMap { _ =>
-            Resource
-              .fromAutoCloseable(IO(Source.fromFile(args.mnemonicPath)))
-              .use(s => IO(s.getLines().next()))
-              .flatMap { mnemonic =>
-                val seed = Mnemonic.toSeed(mnemonic)
-                val rootSk = ExtendedSecretKey.deriveMasterKey(seed)
-                IO.fromTry(Try(java.lang.Runtime.getRuntime.availableProcessors))
-                  .flatMap { numCores =>
-                    val env = TaskEnv(args.address, rootSk, args.leafsNum, numCores)
-                    task(env)(ae).flatMap {
-                      case Some(p) => UIO(println(s"Derivation path is: $p"))
-                      case _       => UIO(println("Nothing found"))
-                    }
+    IO.fromTry(argParser.parse(args))
+      .flatMap { args =>
+        val ae = ErgoAddressEncoder(args.networkPrefix)
+        IO.fromTry(ae.fromString(args.address)).flatMap { _ =>
+          Resource
+            .fromAutoCloseable(IO(Source.fromFile(args.mnemonicPath)))
+            .use(s => IO(s.getLines().next()))
+            .flatMap { mnemonic =>
+              val seed = Mnemonic.toSeed(mnemonic)
+              val rootSk = ExtendedSecretKey.deriveMasterKey(seed)
+              IO.fromTry(Try(java.lang.Runtime.getRuntime.availableProcessors))
+                .flatMap { numCores =>
+                  val env =
+                    TaskEnv(args.address, rootSk, args.leafsNum, numCores)
+                  task(env)(ae).flatMap {
+                    case Some(p) => UIO(println(s"Derivation path is: $p"))
+                    case _       => UIO(println("Nothing found"))
                   }
-              }
-          }
+                }
+            }
         }
+      }
 
   def run(args: List[String]): ZIO[PathMatcher.Environment, Nothing, Int] =
     program(args.toArray).fold(_ => 1, _ => 0)
